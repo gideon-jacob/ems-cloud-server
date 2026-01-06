@@ -13,6 +13,7 @@ const app = express();
 const httpServer = createServer(app);
 
 // Security Middleware
+app.use(express.json());
 app.use(helmet());
 app.use(cors({
     origin: ["http://localhost:3000", "http://localhost:5173", "*"], //! Specific origins
@@ -71,7 +72,16 @@ io.on("connection", (socket) => {
 
     socket.on("set-row-limit", (limit: number) => {
         // Enforce 60-3600 limit
-        socketLimits.set(socket.id, Math.min(Math.max(limit, MIN_LIMIT), MAX_LIMIT));
+        const safeLimit = Math.min(Math.max(limit, MIN_LIMIT), MAX_LIMIT);
+        socketLimits.set(socket.id, safeLimit);
+
+        // Fetch and emit immediately with new limit
+        fetchAndGroupData(supabase, MAX_LIMIT).then((groupedData) => {
+            if (groupedData) {
+                const customizedData = sliceGroupedData(groupedData, safeLimit);
+                socket.emit("table:topN", { rows: customizedData, limit: safeLimit });
+            }
+        });
     });
 
     socket.on("disconnect", () => {
@@ -80,47 +90,31 @@ io.on("connection", (socket) => {
     });
 });
 
-// 3. Supabase Realtime Subscription (EXACT)
-let debounceTimer: NodeJS.Timeout | null = null;
+// Webhook to Trigger Update
+app.post("/db-trigger-hook", async (req, res) => {
+    console.log("DB Trigger Hook received");
 
-// supabase
-//     .channel("room:42:messages:", { config: { private: true } })
-//     .on("postgres_changes", {
-//         event: "INSERT",
-//         schema: "public",
-//         table: TABLE_NAME,
-//     }, (payload) => {
-//         console.log("triggered");
-//         console.log(payload);
-//         // Clear existing timer
-//         if (debounceTimer) clearTimeout(debounceTimer);
+    try {
+        const groupedData = await fetchAndGroupData(supabase, MAX_LIMIT);
 
-//         // Set new timer (Debounce for 100ms)
-//         debounceTimer = setTimeout(async () => {
-//             console.log("Processing batch INSERT event");
-//             try {
-//                 const groupedData = await fetchAndGroupData(supabase, MAX_LIMIT);
-//                 if (!groupedData) return;
+        if (groupedData) {
+            // Emit PER-SOCKET with THEIR limit
+            socketLimits.forEach((limit, socketId) => {
+                const customizedData = sliceGroupedData(groupedData, limit);
 
-//                 // Emit PER-SOCKET with THEIR limit
-//                 socketLimits.forEach((limit, socketId) => {
-//                     const customizedData = sliceGroupedData(groupedData, limit);
+                const socket = io.sockets.sockets.get(socketId);
+                if (socket) {
+                    socket.emit("table:topN", { rows: customizedData, limit });
+                }
+            });
+        }
 
-//                     const socket = io.sockets.sockets.get(socketId);
-//                     if (socket) {
-//                         socket.emit("table:topN", { rows: customizedData, limit });
-//                     }
-//                 });
-//             } catch (err) {
-//                 console.error("Error processing INSERT event:", err);
-//             } finally {
-//                 debounceTimer = null;
-//             }
-//         }, 100);
-//     })
-//     .subscribe((status) => {
-//         console.log(`Supabase Realtime status: ${status}`);
-//     });
+        res.status(200).json({ status: "success", message: "Broadcast triggered" });
+    } catch (error) {
+        console.error("Error in db trigger hook:", error);
+        res.status(500).json({ status: "error", message: "Internal server error" });
+    }
+});
 
 // Start Server
 httpServer.listen(PORT, () => {
